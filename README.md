@@ -385,20 +385,113 @@ If this occurs, use Codex normally on the server once so that the official Codex
 
 ## Data retention
 
-Every successful poll is stored.
+The collector still records one raw observation for every successful polling
+interval.
 
-Even if the quota value has not changed, a new sample is recorded every 60 seconds.
+At the default 60-second interval and two quota windows, this would otherwise
+produce roughly one million rows per year.
 
-This makes the database a true time-series observation log and preserves:
+To avoid storing large numbers of redundant samples during periods where quota
+does not change, the logger performs lossless stable-run compaction.
 
-- periods of inactivity
-- quota consumption timing
-- quota reset transitions
-- periods where sampling was unavailable
+Compaction runs:
 
-There is currently no automatic data deletion.
+```text
+once at application startup
+once every 24 hours while the application is running
+```
 
-At the default interval and two quota windows, the database grows slowly enough for long-term personal use.
+Each quota window is processed independently.
+
+A sequence of samples belongs to the same stable run only when all of the
+following remain true:
+
+```text
+used_percent is identical
+resets_at is identical
+the raw sampling gap does not exceed max(180 seconds, 3 × polling interval)
+```
+
+For every stable run:
+
+```text
+first sample     kept
+middle samples   deleted
+last sample      kept
+```
+
+For example:
+
+```text
+12:00  89%
+12:01  89%
+12:02  89%
+12:03  89%
+12:04  89%
+```
+
+is compacted to:
+
+```text
+12:00  89%
+12:04  89%
+```
+
+The dashboard therefore renders exactly the same horizontal quota segment.
+
+When the quota changes:
+
+```text
+12:04  89%
+12:05  88%
+```
+
+both boundary points remain, so the original one-minute transition resolution
+is preserved.
+
+Quota reset boundaries are also preserved because `resets_at` is part of the
+stable-run identity.
+
+### Sampling gaps
+
+Compaction does not merge across large sampling gaps.
+
+For the default 60-second polling interval, a gap larger than 180 seconds
+starts a new run even if the quota value is unchanged.
+
+Therefore, if the logger stops for several hours and later restarts with the
+same quota value, the two periods remain separate in the database.
+
+### Incremental compaction state
+
+The logger does not rescan the entire SQLite history every day.
+
+SQLite stores a tiny internal table, `compaction_state`, with one row per quota
+window. It records the first and last retained row of the current tail run,
+the last raw sample timestamp, the last quota value, and the last reset
+timestamp.
+
+The last retained row also acts as the persistent scan cursor. As a result,
+each daily compaction normally examines only data collected since the previous
+compaction.
+
+If newly collected samples continue the previous stable run, the old tail is
+extended correctly and the previous endpoint becomes an interior point that
+can be removed.
+
+### SQLite file size
+
+Deleting SQLite rows does not necessarily make `quota.db` immediately smaller
+on disk.
+
+SQLite normally keeps freed pages inside the database and reuses them for
+future inserts. The logger intentionally does not run `VACUUM` automatically
+because `VACUUM` rewrites the entire database and is unnecessary for routine
+operation.
+
+If a very large historical database is compacted for the first time and you
+specifically want to return unused pages to the filesystem, stop the logger
+and manually run a one-time `VACUUM`.
 
 ## Security
 

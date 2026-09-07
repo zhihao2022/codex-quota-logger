@@ -36,6 +36,8 @@ DEFAULT_DB_PATH = Path("data") / "quota.db"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 DEFAULT_INTERVAL = 60.0
+COMPACTION_PERIOD_SECONDS = 24 * 60 * 60
+COMPACTION_MIN_GAP_SECONDS = 180
 
 LOG = logging.getLogger(APP_NAME)
 
@@ -290,6 +292,19 @@ class Database:
                 """
             )
 
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS compaction_state (
+                    window_seconds       INTEGER PRIMARY KEY,
+                    tail_first_id        INTEGER NOT NULL,
+                    tail_last_id         INTEGER NOT NULL,
+                    tail_last_sampled_at INTEGER NOT NULL,
+                    tail_used_percent    REAL NOT NULL,
+                    tail_resets_at       INTEGER
+                )
+                """
+            )
+
     def insert_samples(
         self,
         sampled_at: int,
@@ -405,6 +420,180 @@ class Database:
             ).fetchone()
 
         return int(row["count"])
+
+    def compact_identical_runs(
+        self,
+        expected_interval: float,
+    ) -> dict[str, int]:
+        """Compact stable quota runs while preserving their endpoints."""
+
+        max_gap_seconds = max(
+            COMPACTION_MIN_GAP_SECONDS,
+            int(expected_interval * 3),
+        )
+        stats = {
+            "windows": 0,
+            "new_rows": 0,
+            "deleted_rows": 0,
+            "max_gap_seconds": max_gap_seconds,
+        }
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                windows = [
+                    int(row["window_seconds"])
+                    for row in connection.execute(
+                        """
+                        SELECT DISTINCT window_seconds
+                        FROM quota_samples
+                        ORDER BY window_seconds
+                        """
+                    ).fetchall()
+                ]
+
+                for window_seconds in windows:
+                    state = connection.execute(
+                        """
+                        SELECT tail_first_id, tail_last_id,
+                               tail_last_sampled_at, tail_used_percent,
+                               tail_resets_at
+                        FROM compaction_state
+                        WHERE window_seconds = ?
+                        """,
+                        (window_seconds,),
+                    ).fetchone()
+
+                    if state is not None:
+                        tail_exists = connection.execute(
+                            """
+                            SELECT 1 FROM quota_samples
+                            WHERE id = ? AND window_seconds = ?
+                            """,
+                            (int(state["tail_last_id"]), window_seconds),
+                        ).fetchone()
+                        if tail_exists is None:
+                            LOG.warning(
+                                "compaction state for %s is stale; "
+                                "rebuilding from existing history",
+                                format_window(window_seconds),
+                            )
+                            connection.execute(
+                                "DELETE FROM compaction_state "
+                                "WHERE window_seconds = ?",
+                                (window_seconds,),
+                            )
+                            state = None
+
+                    cursor_id = int(state["tail_last_id"]) if state else 0
+                    rows = connection.execute(
+                        """
+                        SELECT id, sampled_at, used_percent, resets_at
+                        FROM quota_samples
+                        WHERE window_seconds = ? AND id > ?
+                        ORDER BY id
+                        """,
+                        (window_seconds, cursor_id),
+                    ).fetchall()
+                    if not rows:
+                        continue
+
+                    stats["windows"] += 1
+                    stats["new_rows"] += len(rows)
+
+                    if state is None:
+                        run_first_id = None
+                        run_last_id = None
+                        previous_sampled_at = None
+                        previous_signature = None
+                    else:
+                        run_first_id = int(state["tail_first_id"])
+                        run_last_id = int(state["tail_last_id"])
+                        previous_sampled_at = int(state["tail_last_sampled_at"])
+                        previous_signature = (
+                            float(state["tail_used_percent"]),
+                            int(state["tail_resets_at"])
+                            if state["tail_resets_at"] is not None
+                            else None,
+                        )
+
+                    delete_ids = []
+                    for row in rows:
+                        row_id = int(row["id"])
+                        sampled_at = int(row["sampled_at"])
+                        signature = (
+                            float(row["used_percent"]),
+                            int(row["resets_at"])
+                            if row["resets_at"] is not None
+                            else None,
+                        )
+
+                        continues_run = False
+                        if (
+                            run_first_id is not None
+                            and run_last_id is not None
+                            and previous_sampled_at is not None
+                            and previous_signature is not None
+                        ):
+                            gap = sampled_at - previous_sampled_at
+                            continues_run = (
+                                signature == previous_signature
+                                and 0 <= gap <= max_gap_seconds
+                            )
+
+                        if continues_run:
+                            if run_last_id != run_first_id:
+                                delete_ids.append(run_last_id)
+                            run_last_id = row_id
+                        else:
+                            run_first_id = row_id
+                            run_last_id = row_id
+
+                        previous_sampled_at = sampled_at
+                        previous_signature = signature
+
+                    if delete_ids:
+                        connection.executemany(
+                            "DELETE FROM quota_samples WHERE id = ?",
+                            [(row_id,) for row_id in delete_ids],
+                        )
+                        stats["deleted_rows"] += len(delete_ids)
+
+                    assert run_first_id is not None
+                    assert run_last_id is not None
+                    assert previous_sampled_at is not None
+                    assert previous_signature is not None
+                    connection.execute(
+                        """
+                        INSERT INTO compaction_state (
+                            window_seconds, tail_first_id, tail_last_id,
+                            tail_last_sampled_at, tail_used_percent,
+                            tail_resets_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(window_seconds) DO UPDATE SET
+                            tail_first_id = excluded.tail_first_id,
+                            tail_last_id = excluded.tail_last_id,
+                            tail_last_sampled_at = excluded.tail_last_sampled_at,
+                            tail_used_percent = excluded.tail_used_percent,
+                            tail_resets_at = excluded.tail_resets_at
+                        """,
+                        (
+                            window_seconds,
+                            run_first_id,
+                            run_last_id,
+                            previous_sampled_at,
+                            previous_signature[0],
+                            previous_signature[1],
+                        ),
+                    )
+
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
+        return stats
 
 
 class Sampler:
@@ -1939,6 +2128,31 @@ def main() -> int:
     LOG.info("database: %s", database.path.resolve())
     LOG.info("auth file: %s", args.auth)
 
+    def compact_database() -> None:
+        try:
+            stats = database.compact_identical_runs(
+                expected_interval=args.interval,
+            )
+        except Exception:
+            LOG.exception("quota history compaction failed")
+            return
+
+        if stats["new_rows"] == 0:
+            LOG.debug("quota history compaction: nothing new")
+            return
+
+        LOG.info(
+            "quota history compacted: windows=%d new_rows=%d deleted=%d "
+            "max_gap=%ds",
+            stats["windows"],
+            stats["new_rows"],
+            stats["deleted_rows"],
+            stats["max_gap_seconds"],
+        )
+
+    LOG.info("running startup quota history compaction")
+    compact_database()
+
     client = QuotaClient(
         auth_path=args.auth,
     )
@@ -1980,6 +2194,16 @@ def main() -> int:
         daemon=False,
     )
 
+    def maintenance_loop() -> None:
+        while not stop_event.wait(COMPACTION_PERIOD_SECONDS):
+            compact_database()
+
+    maintenance_thread = threading.Thread(
+        target=maintenance_loop,
+        name="quota-maintenance",
+        daemon=False,
+    )
+
     def request_shutdown(
         signum: int,
         _frame: Any,
@@ -1992,6 +2216,7 @@ def main() -> int:
 
     sampler_thread.start()
     http_thread.start()
+    maintenance_thread.start()
 
     LOG.info(
         "dashboard: http://%s:%s",
@@ -2017,6 +2242,7 @@ def main() -> int:
         server.server_close()
 
         http_thread.join(timeout=5)
+        maintenance_thread.join(timeout=5)
         sampler_thread.join(timeout=max(5.0, args.interval + 2.0))
 
         LOG.info("stopped")
